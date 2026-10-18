@@ -32,12 +32,20 @@ BREVO_API_KEY = os.getenv("BREVO_API_KEY", "").strip()
 BREVO_SENDER_EMAIL = os.getenv("BREVO_SENDER_EMAIL", "").strip()
 
 # ---- Google Search Console / SEO -------------------------------------------
-# Public address of the deployed site (no trailing slash). Override it in .env
-# with SITE_URL=https://your-domain.com when you move to a custom domain.
-SITE_URL = os.getenv(
-    "SITE_URL",
-    "https://weathergpt-o42w.onrender.com",
-).strip().rstrip("/")
+# Public address of the deployed site (no trailing slash). Optional: if
+# SITE_URL is not set, the address the visitor (or Googlebot) used to reach
+# the site is used automatically, so the sitemap can never point to a wrong
+# domain. Set SITE_URL=https://your-domain.com to force a fixed address.
+SITE_URL = os.getenv("SITE_URL", "").strip().rstrip("/")
+
+
+def site_url():
+    if SITE_URL:
+        return SITE_URL
+    # Render sits behind a proxy; always use https for the public address.
+    host = request.headers.get("X-Forwarded-Host", request.host)
+    scheme = "http" if host.startswith(("127.0.0.1", "localhost")) else "https"
+    return "%s://%s" % (scheme, host)
 
 # File name given by Search Console ("HTML file" verification method).
 GOOGLE_VERIFICATION_FILE = os.getenv(
@@ -59,7 +67,7 @@ print("Weather API Key Loaded:", bool(WEATHER_API_KEY))
 print("Groq API Key Loaded:", bool(GROQ_API_KEY))
 print("Brevo API Key Loaded:", bool(BREVO_API_KEY))
 print("Brevo Sender Email Configured:", bool(BREVO_SENDER_EMAIL))
-print("Site URL:", SITE_URL)
+print("Site URL:", SITE_URL or "(auto-detected from request)")
 print("=" * 60)
 
 # =========================================================
@@ -92,7 +100,7 @@ def _seo_response(body, mimetype):
 @app.route("/sitemap.xml", methods=["GET"])
 def sitemap():
     entries = "".join(
-        "  <url>\n    <loc>%s%s</loc>\n  </url>\n" % (SITE_URL, page)
+        "  <url>\n    <loc>%s%s</loc>\n  </url>\n" % (site_url(), page)
         for page in PUBLIC_SEO_PAGES
     )
 
@@ -120,7 +128,7 @@ def robots_txt():
         "Disallow: /historical\n"
         "Disallow: /location-search\n"
         "\n"
-        "Sitemap: %s/sitemap.xml\n" % SITE_URL
+        "Sitemap: %s/sitemap.xml\n" % site_url()
     )
 
     return _seo_response(content, "text/plain")
