@@ -214,3 +214,6 @@
 /* hidden-state overrides + nav alert badge */
 .anomaly-list[hidden], .farm-ai-out[hidden], .fx-badge[hidden], .radar-bar[hidden] { display: none !important; }
 .feature-nav a[data-count]:not([data-count="0"])::after { content: attr(data-count); display: inline-grid; place-items: center; min-width: 17px; height: 17px; margin-left: 7px; padding: 0 5px; border-radius: 99px; font-size: 10px; font-weight: 800; color: #fff; background: #ef4444; animation: fxPop .5s var(--fx-spring); }
+
+/* Dark look for the free OpenStreetMap base map (weather overlays live in their own pane, so they keep their colours) */
+#weatherMap .leaflet-tile-pane{filter:invert(1) hue-rotate(180deg) brightness(.92) contrast(.92) saturate(.65)}

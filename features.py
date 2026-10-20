@@ -1,7 +1,6 @@
 # -*- coding: utf-8 -*-
-"""WeatherGPT feature APIs using OpenWeather forecasts, plus map tiles and geocoding.
-Long-term climate history requires a separate historical-data provider.
-"""
+"""WeatherGPT feature APIs: forecast intelligence, alerts, recommendations, travel,
+farmer advisory, climate analytics, map tiles and reverse geocoding."""
 
 import base64
 import math
@@ -107,146 +106,91 @@ def span(hours):
     """'17:00–20:00' for a list of hourly dicts."""
     if not hours:
         return ""
-    step = 3
-    return "%s–%s" % (fmt_hour(hours[0]["hour"]), fmt_hour(hours[-1]["hour"] + step))
+    return "%s–%s" % (fmt_hour(hours[0]["hour"]), fmt_hour(hours[-1]["hour"] + 1))
 
 
 # ---------------------------------------------------------------------------
-# OpenWeather 5-day forecast bundle (standard /data/2.5/forecast API)
+# Open-Meteo bundle (hourly + daily)
 # ---------------------------------------------------------------------------
 
-OW_FORECAST = "https://api.openweathermap.org/data/2.5/forecast"
-OW_CURRENT = "https://api.openweathermap.org/data/2.5/weather"
+_UA = {"User-Agent": "WeatherGPT/1.0 (weather app; open-meteo client)"}
 
 
-def _ow_condition_code(item):
-    """Map OpenWeather condition IDs to the WMO-like groups used by this app."""
-    weather = (item.get("weather") or [{}])[0]
-    oid = int(weather.get("id") or 800)
-    if 200 <= oid < 300:
-        return 95
-    if 300 <= oid < 400:
-        return 51
-    if 500 <= oid < 600:
-        return 65 if oid in (502, 503, 504, 522, 531) else 61
-    if 600 <= oid < 700:
-        return 71
-    if 700 <= oid < 800:
-        return 45
-    if oid == 800:
-        return 0
-    if oid == 801:
-        return 2
-    if oid == 802:
-        return 2
-    return 3
+def om_get(url, params, timeout=20, tries=3):
+    """GET with a User-Agent, retries on 429/5xx/timeouts, and a readable error message."""
+    last = None
+    host = url.split("/")[2]
+    for n in range(tries):
+        try:
+            r = requests.get(url, params=params, headers=_UA, timeout=timeout)
+            if r.status_code == 200:
+                return r
+            try:
+                reason = r.json().get("reason") or r.text[:160]
+            except Exception:
+                reason = r.text[:160]
+            last = "HTTP %s from %s: %s" % (r.status_code, host, reason)
+            if r.status_code < 500 and r.status_code != 429:
+                break
+        except requests.RequestException as e:
+            last = "%s while contacting %s" % (type(e).__name__, host)
+        time.sleep(0.8 * (n + 1))
+    raise RuntimeError(last or "request failed")
 
 
-def _request_openweather(url, params, timeout=15):
-    response = requests.get(url, params=params, timeout=timeout)
-    if response.status_code == 401:
-        raise ValueError("OpenWeather rejected the API key. Check WEATHER_API_KEY in Render.")
-    if response.status_code == 429:
-        raise ValueError("OpenWeather rate limit reached. Please try again shortly.")
-    response.raise_for_status()
-    data = response.json()
-    if isinstance(data, dict) and data.get("cod") not in (None, 200, "200"):
-        raise ValueError(data.get("message", "OpenWeather returned an API error."))
-    return data
+OM_FORECAST = "https://api.open-meteo.com/v1/forecast"
+HOURLY_VARS = ("temperature_2m,apparent_temperature,relative_humidity_2m,precipitation_probability,"
+               "precipitation,weather_code,visibility,wind_speed_10m,wind_gusts_10m,wind_direction_10m,"
+               "uv_index,cloud_cover,is_day")
+DAILY_VARS = ("weather_code,temperature_2m_max,temperature_2m_min,precipitation_sum,"
+              "precipitation_probability_max,wind_speed_10m_max,wind_gusts_10m_max,uv_index_max,"
+              "et0_fao_evapotranspiration,sunrise,sunset")
 
 
 def fetch_bundle(lat, lon):
-    """Return forecast data normalized to WeatherGPT's internal schema.
-
-    The standard OpenWeather forecast API returns 3-hour forecast steps for
-    about five days. It does not supply UV index or evapotranspiration, so
-    those fields use neutral/fallback values rather than invented readings.
-    """
-    key = ("ow_bundle", round(lat, 2), round(lon, 2))
+    key = ("bundle", round(lat, 2), round(lon, 2))
     hit = cache_get(key, 600)
     if hit:
         return hit
 
-    api_key = _ctx.get("weather_key") or os.getenv("WEATHER_API_KEY")
-    if not api_key:
-        raise ValueError("WEATHER_API_KEY is not configured.")
-
-    params = {"lat": lat, "lon": lon, "appid": api_key, "units": "metric"}
-    data = _request_openweather(OW_FORECAST, params)
-    entries = data.get("list") or []
-    if not entries:
-        raise ValueError("OpenWeather returned no forecast data.")
-
-    city = data.get("city") or {}
-    offset = int(city.get("timezone") or 0)
+    params = {"latitude": lat, "longitude": lon, "hourly": HOURLY_VARS, "daily": DAILY_VARS,
+              "timezone": "auto", "forecast_days": 7, "wind_speed_unit": "kmh"}
+    resp = om_get(OM_FORECAST, params, timeout=20)
+    j = resp.json()
+    h, d = j.get("hourly", {}), j.get("daily", {})
+    times = h.get("time", [])
+    offset = int(j.get("utc_offset_seconds", 0) or 0)
     now_local = datetime.now(timezone.utc) + timedelta(seconds=offset)
-    hourly = []
-    for entry in entries:
-        dt_utc = datetime.fromtimestamp(int(entry.get("dt") or 0), timezone.utc)
-        dt_local = dt_utc + timedelta(seconds=offset)
-        main = entry.get("main") or {}
-        wind = entry.get("wind") or {}
-        rain_obj = entry.get("rain") or {}
-        weather = (entry.get("weather") or [{}])[0]
-        # OpenWeather's rain.3h is a total for the three-hour forecast period.
-        hourly.append({
-            "time": dt_local.strftime("%Y-%m-%dT%H:%M"),
-            "date": dt_local.strftime("%Y-%m-%d"),
-            "hour": dt_local.hour,
-            "temp": float(main.get("temp") or 0),
-            "feels": float(main.get("feels_like", main.get("temp", 0)) or 0),
-            "hum": float(main.get("humidity") or 0),
-            "pp": round(float(entry.get("pop") or 0) * 100),
-            "mm": float(rain_obj.get("3h") or 0),
-            "code": _ow_condition_code(entry),
-            "vis": float(entry.get("visibility") if entry.get("visibility") is not None else 10000) / 1000.0,
-            "wind": float(wind.get("speed") or 0) * 3.6,
-            "gust": float(wind.get("gust", wind.get("speed", 0)) or 0) * 3.6,
-            "wdir": float(wind.get("deg") or 0),
-            "uv": 0.0,  # UV is not included in the standard 5-day forecast API.
-            "cloud": float((entry.get("clouds") or {}).get("all") or 0),
-            "day": int(6 <= dt_local.hour < 18),
-        })
+    now_key = now_local.strftime("%Y-%m-%dT%H:00")
+    start = times.index(now_key) if now_key in times else 0
 
-    grouped = {}
-    for x in hourly:
-        grouped.setdefault(x["date"], []).append(x)
+    hourly = []
+    for i in range(start, min(start + 72, len(times))):
+        t = times[i]
+        hourly.append({
+            "time": t, "date": t[:10], "hour": int(t[11:13]),
+            "temp": num(h.get("temperature_2m"), i), "feels": num(h.get("apparent_temperature"), i),
+            "hum": num(h.get("relative_humidity_2m"), i), "pp": num(h.get("precipitation_probability"), i),
+            "mm": num(h.get("precipitation"), i), "code": int(num(h.get("weather_code"), i)),
+            "vis": num(h.get("visibility"), i, 10000) / 1000.0, "wind": num(h.get("wind_speed_10m"), i),
+            "gust": num(h.get("wind_gusts_10m"), i), "wdir": num(h.get("wind_direction_10m"), i),
+            "uv": num(h.get("uv_index"), i), "cloud": num(h.get("cloud_cover"), i),
+            "day": int(num(h.get("is_day"), i, 1)),
+        })
 
     daily = []
-    for date, samples in grouped.items():
-        max_sample = max(samples, key=lambda x: x["temp"])
-        min_sample = min(samples, key=lambda x: x["temp"])
-        wind_max = max(x["wind"] for x in samples)
-        gust_max = max(x["gust"] for x in samples)
-        rain_sum = sum(x["mm"] for x in samples)
-        severe = max(samples, key=lambda x: (
-            x["code"] in (95, 96, 99),
-            x["code"] in (61, 65, 71, 82),
-            x["code"]
-        ))
+    for i, date in enumerate(d.get("time", [])):
         daily.append({
-            "date": date,
-            "tmax": max_sample["temp"],
-            "tmin": min_sample["temp"],
-            "pp": max(x["pp"] for x in samples),
-            "mm": rain_sum,
-            "wind": wind_max,
-            "gust": gust_max,
-            "uv": 0.0,
-            "et0": 4.0,  # fallback; not supplied by the standard forecast API
-            "code": severe["code"],
-            "sunrise": "",
-            "sunset": "",
+            "date": date, "tmax": num(d.get("temperature_2m_max"), i), "tmin": num(d.get("temperature_2m_min"), i),
+            "pp": num(d.get("precipitation_probability_max"), i), "mm": num(d.get("precipitation_sum"), i),
+            "wind": num(d.get("wind_speed_10m_max"), i), "gust": num(d.get("wind_gusts_10m_max"), i),
+            "uv": num(d.get("uv_index_max"), i), "et0": num(d.get("et0_fao_evapotranspiration"), i, 4.0),
+            "code": int(num(d.get("weather_code"), i)),
+            "sunrise": (d.get("sunrise") or [""] * (i + 1))[i][11:16] if d.get("sunrise") else "",
+            "sunset": (d.get("sunset") or [""] * (i + 1))[i][11:16] if d.get("sunset") else "",
         })
 
-    bundle = {
-        "hourly": hourly,
-        "daily": daily,
-        "offset": offset,
-        "today": now_local.strftime("%Y-%m-%d"),
-        "interval_hours": 3,
-        "source": "openweather",
-    }
+    bundle = {"hourly": hourly, "daily": daily, "offset": offset, "today": now_local.strftime("%Y-%m-%d")}
     return cache_set(key, bundle)
 
 
@@ -258,7 +202,7 @@ LEVEL_RANK = {"extreme": 0, "warning": 1, "advisory": 2, "ok": 3}
 
 
 def compute_alerts(b, lang):
-    h24 = b["hourly"][:8]  # 8 three-hour steps ~= 24 hours
+    h24 = b["hourly"][:24]
     if not h24:
         return []
     alerts = []
@@ -346,11 +290,11 @@ def compute_travel(b, lang):
     hours = b["hourly"]
     if not hours:
         return {}
-    nxt = hours[:1]  # first available 3-hour forecast step
+    nxt = hours[:3]
     score = round(sum(score_of(x) for x in nxt) / len(nxt))
     verdict_key = "v_excellent" if score >= 80 else "v_good" if score >= 60 else "v_risky" if score >= 40 else "v_avoid"
 
-    six = hours[:2]  # 6 hours represented by two 3-hour steps
+    six = hours[:6]
     pen = hour_penalty({
         "pp": max(x["pp"] for x in six), "mm": sum(x["mm"] for x in six), "gust": max(x["gust"] for x in six),
         "feels": hours[0]["feels"], "vis": min(x["vis"] for x in six),
@@ -366,7 +310,7 @@ def compute_travel(b, lang):
 
     window_len = 3
     scored = []
-    for i in range(0, max(0, min(8, len(hours)) - window_len + 1)):
+    for i in range(0, max(0, min(24, len(hours)) - window_len + 1)):
         w = hours[i:i + window_len]
         avg = sum(score_of(x) for x in w) / window_len
         daytime = all(5 <= x["hour"] <= 21 for x in w)
@@ -391,7 +335,7 @@ def compute_travel(b, lang):
 def compute_recommendations(b, lang, travel):
     h = b["hourly"]
     now = h[0]
-    h12 = h[:4]  # approximately next 12 hours
+    h12 = h[:12]
     daily0 = b["daily"][0] if b["daily"] else {"uv": now["uv"]}
     rain_p = max(x["pp"] for x in h12)
     rain_hours = [x for x in h12 if x["pp"] >= 50 or x["mm"] >= 0.5]
@@ -424,7 +368,7 @@ def compute_recommendations(b, lang, travel):
         umb.append(tr(lang, "u_sun"))
 
     # outdoor
-    ok_hours = [x for x in h[:8] if 6 <= x["hour"] <= 20 and x["pp"] < 30 and x["mm"] == 0 and x["feels"] <= 34 and x["gust"] < 35]
+    ok_hours = [x for x in h[:24] if 6 <= x["hour"] <= 20 and x["pp"] < 30 and x["mm"] == 0 and x["feels"] <= 34 and x["gust"] < 35]
     score_now = score_of(now)
     if score_now >= 75 and now["feels"] <= 34:
         out = [tr(lang, "o_good")]
@@ -493,7 +437,7 @@ def day_label(b, date, lang):
 def compute_farm(b, lang, crop):
     kc = CROPS.get(crop, 1.0)
     h, d = b["hourly"], b["daily"]
-    h48, h24 = h[:16], h[:8]  # 48h and 24h using 3-hour forecast steps
+    h48, h24 = h[:48], h[:24]
     cards = []
 
     # irrigation
@@ -741,22 +685,181 @@ def api_farmer_ai():
 
 
 # ---------------------------------------------------------------------------
-# Climate history is not available from OpenWeather's standard forecast API.
+# Climate intelligence (Open-Meteo archive)
 # ---------------------------------------------------------------------------
+
+OM_ARCHIVE = "https://archive-api.open-meteo.com/v1/archive"
+
+
+def linreg(xs, ys):
+    n = len(xs)
+    if n < 3:
+        return 0.0
+    mx, my = sum(xs) / n, sum(ys) / n
+    den = sum((x - mx) ** 2 for x in xs)
+    return sum((x - mx) * (y - my) for x, y in zip(xs, ys)) / den if den else 0.0
+
+
+def mean(v):
+    return sum(v) / len(v) if v else 0.0
+
+
+def std(v):
+    if len(v) < 3:
+        return 0.0
+    m = mean(v)
+    return math.sqrt(sum((x - m) ** 2 for x in v) / (len(v) - 1))
+
+
+def _nasa_history(lat, lon, y0, y1, err):
+    """Keyless fallback (NASA POWER) when Open-Meteo's archive cannot be reached."""
+    try:
+        r = om_get("https://power.larc.nasa.gov/api/temporal/daily/point",
+                   {"parameters": "T2M,T2M_MAX,T2M_MIN,PRECTOTCORR", "community": "AG", "longitude": lon, "latitude": lat,
+                    "start": "%d0101" % y0, "end": "%d1231" % y1, "format": "JSON"}, timeout=90, tries=2)
+        p = r.json()["properties"]["parameter"]
+        days = sorted(p["T2M"].keys())
+
+        def col(name):
+            return [None if p[name][d] in (-999, -999.0) else p[name][d] for d in days]
+        return {"time": ["%s-%s-%s" % (d[:4], d[4:6], d[6:]) for d in days], "temperature_2m_mean": col("T2M"),
+                "temperature_2m_max": col("T2M_MAX"), "temperature_2m_min": col("T2M_MIN"), "precipitation_sum": col("PRECTOTCORR")}
+    except Exception as e2:
+        raise RuntimeError("%s. Fallback (NASA POWER) also failed: %s" % (err, e2))
+
+
+def fetch_history(lat, lon, first_year, last_year):
+    """Daily history in 5-year chunks (smaller requests are far less likely to time out or be rate limited)."""
+    keys = ("temperature_2m_mean", "temperature_2m_max", "temperature_2m_min", "precipitation_sum")
+    daily = {"time": [], **{k: [] for k in keys}}
+    try:
+        y = first_year
+        while y <= last_year:
+            y1 = min(y + 4, last_year)
+            d = om_get(OM_ARCHIVE, {"latitude": lat, "longitude": lon, "start_date": "%d-01-01" % y, "end_date": "%d-12-31" % y1,
+                                    "daily": ",".join(keys), "timezone": "auto"}, timeout=40).json().get("daily", {})
+            n = len(d.get("time", []))
+            if not n:
+                raise RuntimeError("Open-Meteo archive returned no data")
+            daily["time"] += d["time"]
+            for k in keys:
+                daily[k] += d.get(k) or [None] * n
+            y = y1 + 1
+        return daily
+    except Exception as e:
+        return _nasa_history(lat, lon, first_year, last_year, e)
+
+
+def compute_climate(lat, lon, years):
+    key = ("climate", round(lat, 1), round(lon, 1), years)
+    hit = cache_get(key, 6 * 3600)
+    if hit:
+        return hit
+
+    today = datetime.now(timezone.utc).date()
+    last_year = today.year - 1
+    first_year = last_year - years + 1
+    daily = fetch_history(lat, lon, first_year, last_year)
+    dates = daily.get("time", [])
+    if not dates:
+        raise ValueError("No historical data returned.")
+
+    months, yearly = {}, {}
+    for i, ds in enumerate(dates):
+        y, m = int(ds[:4]), int(ds[5:7])
+        tm = daily["temperature_2m_mean"][i]
+        tx = daily["temperature_2m_max"][i]
+        pr = daily["precipitation_sum"][i]
+        mo = months.setdefault((y, m), {"t": [], "r": 0.0})
+        ye = yearly.setdefault(y, {"t": [], "r": 0.0, "hot": 0, "wet": 0, "tmax": -99.0})
+        if tm is not None:
+            mo["t"].append(tm); ye["t"].append(tm)
+        if pr is not None:
+            mo["r"] += pr; ye["r"] += pr
+            if pr >= 2.5:
+                ye["wet"] += 1
+        if tx is not None:
+            ye["tmax"] = max(ye["tmax"], tx)
+            if tx >= 40:
+                ye["hot"] += 1
+
+    monthly = [{"ym": "%d-%02d" % k, "year": k[0], "month": k[1], "temp": round(mean(v["t"]), 2), "rain": round(v["r"], 1)}
+               for k, v in sorted(months.items())]
+    ylist = [{"year": y, "temp": round(mean(v["t"]), 2), "rain": round(v["r"], 1), "hot_days": v["hot"],
+              "rainy_days": v["wet"], "tmax": round(v["tmax"], 1)} for y, v in sorted(yearly.items())]
+
+    clim_t, clim_r, sd_t, sd_r = [], [], [], []
+    for m in range(1, 13):
+        ts = [x["temp"] for x in monthly if x["month"] == m]
+        rs = [x["rain"] for x in monthly if x["month"] == m]
+        clim_t.append(round(mean(ts), 2)); clim_r.append(round(mean(rs), 1))
+        sd_t.append(std(ts)); sd_r.append(std(rs))
+
+    anomalies = []
+    for x in monthly:
+        m = x["month"] - 1
+        if sd_t[m] > 0.05:
+            z = (x["temp"] - clim_t[m]) / sd_t[m]
+            if abs(z) >= 2:
+                anomalies.append({"ym": x["ym"], "type": "temp", "value": x["temp"], "normal": clim_t[m], "z": round(z, 1)})
+        if sd_r[m] > 1 and clim_r[m] > 5:
+            z = (x["rain"] - clim_r[m]) / sd_r[m]
+            if abs(z) >= 2:
+                anomalies.append({"ym": x["ym"], "type": "rain", "value": x["rain"], "normal": clim_r[m], "z": round(z, 1)})
+    anomalies.sort(key=lambda a: -abs(a["z"]))
+
+    ys = [y["year"] for y in ylist]
+    t_slope = linreg(ys, [y["temp"] for y in ylist]) * 10
+    r_mean = mean([y["rain"] for y in ylist])
+    r_slope = linreg(ys, [y["rain"] for y in ylist]) * 10
+    half = len(ylist) // 2
+    A, B = ylist[:half], ylist[half:]
+
+    def period(rows):
+        return {"from": rows[0]["year"], "to": rows[-1]["year"], "temp": round(mean([r["temp"] for r in rows]), 2),
+                "rain": round(mean([r["rain"] for r in rows]), 1), "hot_days": round(mean([r["hot_days"] for r in rows]), 1),
+                "rainy_days": round(mean([r["rainy_days"] for r in rows]), 1)}
+
+    def month_avg(rows_years, field):
+        out = []
+        for m in range(1, 13):
+            vals = [x[field] for x in monthly if x["month"] == m and x["year"] in rows_years]
+            out.append(round(mean(vals), 2))
+        return out
+
+    pa, pb = period(A), period(B)
+    ya, yb = {r["year"] for r in A}, {r["year"] for r in B}
+    result = {
+        "lat": lat, "lon": lon, "from": first_year, "to": last_year, "monthly": monthly, "yearly": ylist,
+        "climatology": {"temp": clim_t, "rain": clim_r},
+        "trend": {"temp_per_decade": round(t_slope, 2), "rain_pct_per_decade": round(r_slope / r_mean * 100, 1) if r_mean else 0.0},
+        "anomalies": anomalies[:10], "anomaly_count": len(anomalies),
+        "highlights": {"hottest": max(ylist, key=lambda y: y["temp"])["year"], "coldest": min(ylist, key=lambda y: y["temp"])["year"],
+                       "wettest": max(ylist, key=lambda y: y["rain"])["year"], "driest": min(ylist, key=lambda y: y["rain"])["year"]},
+        "compare": {"a": pa, "b": pb,
+                    "delta": {"temp": round(pb["temp"] - pa["temp"], 2), "rain": round(pb["rain"] - pa["rain"], 1),
+                              "rain_pct": round((pb["rain"] - pa["rain"]) / pa["rain"] * 100, 1) if pa["rain"] else 0.0,
+                              "hot_days": round(pb["hot_days"] - pa["hot_days"], 1), "rainy_days": round(pb["rainy_days"] - pa["rainy_days"], 1)},
+                    "monthly": {"a": {"temp": month_avg(ya, "temp"), "rain": month_avg(ya, "rain")},
+                                "b": {"temp": month_avg(yb, "temp"), "rain": month_avg(yb, "rain")}}},
+    }
+    return cache_set(key, result)
+
 
 @bp.route("/api/climate")
 def api_climate():
     lat, lon = get_coords(request.args)
     if lat is None:
         return jsonify({"error": "Valid lat and lon are required."}), 400
-    return jsonify({
-        "error": (
-            "Long-term climate history is not provided by the standard OpenWeather "
-            "forecast API. This feature is disabled rather than returning fabricated data."
-        ),
-        "source": "openweather",
-        "available": False,
-    }), 503
+    try:
+        years = int(request.args.get("years", 10))
+    except ValueError:
+        years = 10
+    years = years if years in (6, 10, 15, 20) else 10
+    try:
+        return jsonify(compute_climate(lat, lon, years))
+    except Exception as e:
+        return jsonify({"error": "Unable to load climate history: %s" % e}), 502
 
 
 # ---------------------------------------------------------------------------

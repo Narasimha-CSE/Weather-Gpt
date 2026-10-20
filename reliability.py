@@ -38,6 +38,31 @@ _ctx = {"groq": None}
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 MODEL_FILE = os.path.join(BASE_DIR, "data", "reliability_model.json")
 
+_UA = {"User-Agent": "WeatherGPT/1.0 (weather app; open-meteo client)"}
+
+
+def om_get(url, params, timeout=20, tries=3):
+    """GET with a User-Agent, retries on 429/5xx/timeouts, and a readable error message."""
+    last = None
+    host = url.split("/")[2]
+    for n in range(tries):
+        try:
+            r = requests.get(url, params=params, headers=_UA, timeout=timeout)
+            if r.status_code == 200:
+                return r
+            try:
+                reason = r.json().get("reason") or r.text[:160]
+            except Exception:
+                reason = r.text[:160]
+            last = "HTTP %s from %s: %s" % (r.status_code, host, reason)
+            if r.status_code < 500 and r.status_code != 429:
+                break
+        except requests.RequestException as e:
+            last = "%s while contacting %s" % (type(e).__name__, host)
+        time.sleep(0.8 * (n + 1))
+    raise RuntimeError(last or "request failed")
+
+
 OM_FORECAST = "https://api.open-meteo.com/v1/forecast"
 OM_PREVIOUS = "https://previous-runs-api.open-meteo.com/v1/forecast"
 OM_ARCHIVE = "https://archive-api.open-meteo.com/v1/archive"
@@ -49,6 +74,7 @@ MODELS = [
     ("gem_seamless", "GEM"),
 ]
 MODEL_LABEL = dict(MODELS)
+MODEL_LABEL["best_match"] = "Open-Meteo"
 
 BUST = {"tmax": 4.0, "rain": 10.0, "gust": 25.0}      # thresholds that define a forecast bust
 WET_MM = 1.0                                           # a day counts as "wet" from 1 mm
@@ -248,30 +274,35 @@ def fetch_models(lat, lon, days=10):
     ids = [m for m, _ in MODELS]
     base = {"latitude": lat, "longitude": lon, "daily": DAILY, "timezone": "auto",
             "forecast_days": days, "wind_speed_unit": "kmh"}
-    dates, series = [], {}
+    dates, series, err = [], {}, None
     try:
-        r = requests.get(OM_FORECAST, params=dict(base, models=",".join(ids)), timeout=20)
-        r.raise_for_status()
+        r = om_get(OM_FORECAST, dict(base, models=",".join(ids)), timeout=20)
         j = r.json()
         dates = j.get("daily", {}).get("time", [])
         series = _parse_daily(j.get("daily", {}), ids)
-    except Exception:
-        series = {}
+    except Exception as e:
+        series, err = {}, e
     if len(series) < 2:                    # combined call failed: ask the models one by one
         series = {}
         for m in ids:
             try:
-                r = requests.get(OM_FORECAST, params=dict(base, models=m), timeout=15)
-                r.raise_for_status()
-                j = r.json()
+                j = om_get(OM_FORECAST, dict(base, models=m), timeout=15, tries=2).json()
                 parsed = _parse_daily(j.get("daily", {}), [m])
                 if parsed:
                     series.update(parsed)
                     dates = dates or j.get("daily", {}).get("time", [])
-            except Exception:
+            except Exception as e:
+                err = e
                 continue
+    if not series:                         # last resort: Open-Meteo's own blended forecast (one model)
+        try:
+            j = om_get(OM_FORECAST, base, timeout=15, tries=2).json()
+            series = _parse_daily(j.get("daily", {}), ["best_match"])
+            dates = j.get("daily", {}).get("time", [])
+        except Exception as e:
+            err = e
     if not series:
-        raise RuntimeError("No forecast model answered.")
+        raise RuntimeError("No forecast model answered (%s)." % (err or "empty response"))
     return cache_set(key, (dates, series))
 
 
@@ -591,8 +622,7 @@ def fetch_verification_data(lat, lon, start, end):
     agg = {"tmax": max, "rain": sum, "gust": max}
     p_arch = {"latitude": lat, "longitude": lon, "start_date": start, "end_date": end,
               "hourly": ",".join(hv.values()), "timezone": "auto", "wind_speed_unit": "kmh"}
-    a = requests.get(OM_ARCHIVE, params=p_arch, timeout=25)
-    a.raise_for_status()
+    a = om_get(OM_ARCHIVE, p_arch, timeout=30)
     ah = a.json().get("hourly", {})
     obs = {k: _daily_from_hourly(ah.get("time", []), ah.get(v, []), agg[k]) for k, v in hv.items()}
 
@@ -601,8 +631,7 @@ def fetch_verification_data(lat, lon, start, end):
         hourly += ["%s_previous_day%d" % (v, L) for L in LEADS]
     p_prev = {"latitude": lat, "longitude": lon, "start_date": start, "end_date": end,
               "hourly": ",".join(hourly), "timezone": "auto", "wind_speed_unit": "kmh"}
-    f = requests.get(OM_PREVIOUS, params=p_prev, timeout=25)
-    f.raise_for_status()
+    f = om_get(OM_PREVIOUS, p_prev, timeout=30)
     fh = f.json().get("hourly", {})
     fc = {}
     for L in LEADS:
@@ -686,10 +715,9 @@ def api_reliability_grid():
     dates = []
     for m in ids:
         try:
-            r = requests.get(OM_FORECAST, params={
+            r = om_get(OM_FORECAST, {
                 "latitude": ",".join(str(p[0]) for p in pts), "longitude": ",".join(str(p[1]) for p in pts),
-                "daily": DAILY, "timezone": "auto", "forecast_days": 10, "wind_speed_unit": "kmh", "models": m}, timeout=25)
-            r.raise_for_status()
+                "daily": DAILY, "timezone": "auto", "forecast_days": 10, "wind_speed_unit": "kmh", "models": m}, timeout=30, tries=2)
             j = r.json()
             j = j if isinstance(j, list) else [j]
             for idx, item in enumerate(j[:len(pts)]):
@@ -702,7 +730,7 @@ def api_reliability_grid():
     model = load_model()
     out = []
     for (a, b), series in zip(pts, per_point):
-        if len(series) < 2:
+        if not series:
             continue
         row = []
         for i in range(len(dates)):

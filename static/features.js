@@ -507,7 +507,9 @@
     function initMap() {
         if (S.map || !window.L || !$("weatherMap")) return;
         S.map = L.map("weatherMap", { zoomControl: true, worldCopyJump: true, minZoom: 3, scrollWheelZoom: false }).setView(S.lat != null ? [S.lat, S.lon] : [20.6, 79], S.lat != null ? 7 : 5);
-        L.tileLayer("https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png", { subdomains: "abcd", maxZoom: 18, attribution: "&copy; OpenStreetMap &copy; CARTO" }).addTo(S.map);
+        const baseTiles = L.tileLayer("https://tile.openstreetmap.org/{z}/{x}/{y}.png", { maxZoom: 19, attribution: "&copy; OpenStreetMap contributors" }).addTo(S.map);
+        let tileErrors = 0;   /* if OpenStreetMap tiles keep failing, switch to Esri's free street map */
+        baseTiles.on("tileerror", () => { if (++tileErrors === 4) { S.map.removeLayer(baseTiles); L.tileLayer("https://server.arcgisonline.com/ArcGIS/rest/services/World_Street_Map/MapServer/tile/{z}/{y}/{x}", { maxZoom: 19, attribution: "Tiles &copy; Esri" }).addTo(S.map); } });
         S.map.createPane("overlayPane2"); S.map.getPane("overlayPane2").style.zIndex = 350;
         S.map.on("click", onMapClick);
         S.map.on("popupopen", (e) => { const b = e.popup.getElement().querySelector(".pop-btn"); if (b) b.addEventListener("click", () => { window.scrollTo({ top: 0, behavior: "smooth" }); window.WG.loadCoordinates(b.dataset.lat, b.dataset.lon, b.dataset.name); S.map.closePopup(); }); });
