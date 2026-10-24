@@ -249,3 +249,8 @@ body[data-mode="phone"] #loginForm, body[data-mode="phone"] #registerForm { tran
 .soc:hover { transform: translateY(-3px); background: rgba(255,255,255,.1); border-color: rgba(143,168,255,.6); }
 .soc:focus-visible { outline: 2px solid #9fb2ff; outline-offset: 3px; }
 @media (max-width: 380px) { .soc span { display: none; } }
+
+/* captcha (login) */
+.cap-img{display:flex;align-items:center;gap:10px;margin:0 0 12px;flex-wrap:wrap}
+.cap-img img{border-radius:10px;border:1px solid rgba(255,255,255,.16);background:#0e2230;max-width:100%;height:auto}
+.pane[data-step="otp"] .cap-row{display:none}
