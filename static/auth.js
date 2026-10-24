@@ -17,6 +17,17 @@
         phone:    { send: "/auth/phone/send",  verify: "/auth/phone/verify", resend: "/auth/phone/send", id: "phone" },
     };
 
+    /* ---------- captcha (login) ---------- */
+    const capImg = document.getElementById("capImg");
+    function loadCaptcha() {
+        if (!capImg) return;
+        capImg.src = "/auth/captcha?t=" + Date.now();
+        if (forms.login.elements.captcha) forms.login.elements.captcha.value = "";
+    }
+    const capBtn = document.getElementById("capRefresh");
+    if (capBtn) capBtn.addEventListener("click", loadCaptcha);
+    loadCaptcha();
+
     /* ---------- tabs ---------- */
     function sizePanes() {
         const active = forms[body.dataset.mode];
@@ -71,6 +82,7 @@
         } else {
             if (mode === "register") check("name", e.name.value.trim().length < 2 ? "Enter your name." : "");
             check("email", EMAIL.test(e.email.value.trim()) ? "" : "Enter a valid email address.");
+            if (mode === "login") check("captcha", e.captcha.value.replace(/\s/g, "").length < 4 ? "Type the captcha shown." : "");
         }
         sizePanes();
         return ok;
@@ -105,9 +117,9 @@
         reg.querySelectorAll(".field").forEach((f) => f.classList.remove("good", "bad"));
         const login = forms.login;
         login.elements.email.value = email;
-        login.querySelector(".sub").textContent = "Account created. Tap Send OTP to log in with " + email + ".";
+        login.querySelector(".sub").textContent = "Account created and email verified. Type the captcha to log in with " + email + ".";
         setMode("login", true);
-        setTimeout(() => { login.querySelector(".btn").focus({ preventScroll: true }); sizePanes(); }, 500);
+        setTimeout(() => { loadCaptcha(); login.elements.captcha.focus({ preventScroll: true }); sizePanes(); }, 500);
     }
     function success(name, url, mode, email) {
         const first = String(name || "").split(" ")[0] || "there";
@@ -122,8 +134,9 @@
         }
         card.classList.add("done");
         body.classList.add("burst");
+        if (mode !== "register") { try { sessionStorage.setItem("wg_splash", "1"); } catch (_) { /* ignore */ } }
         if (mode === "register") { setTimeout(() => afterRegister(email), reduce ? 300 : 2200); return; }
-        setTimeout(() => { window.location.href = url || "/"; }, reduce ? 200 : 1500);
+        setTimeout(() => { window.location.href = url || "/"; }, reduce ? 200 : 700);
     }
 
     /* ---------- OTP step (email and phone) ---------- */
@@ -170,6 +183,7 @@
         const sub = form.querySelector(".sub");
         sub.textContent = sub.dataset.sub || sub.textContent;
         showMsg(form, "");
+        if (form.dataset.pane === "login") loadCaptcha();
         sizePanes();
         if (focus !== false) idInput(form).focus({ preventScroll: true });
     }
@@ -208,7 +222,7 @@
         } else if (verifying) {
             payload = { email: e.email.value.trim(), otp: e.otp.value.trim(), remember: remember };
         } else {
-            payload = mode === "login" ? { email: e.email.value.trim() } : { name: e.name.value.trim(), email: e.email.value.trim() };
+            payload = mode === "login" ? { email: e.email.value.trim(), captcha: e.captcha.value.trim(), remember: remember } : { name: e.name.value.trim(), email: e.email.value.trim() };
         }
         btn.classList.add("loading");
         showMsg(form, "");
@@ -219,10 +233,11 @@
             if (!res.ok) {
                 if (data.fields) Object.entries(data.fields).forEach(([k, v]) => { if (form.elements[k]) setErr(form, k, v); });
                 showMsg(form, data.error || "Something went wrong. Please try again.");
+                if (mode === "login" && !verifying) loadCaptcha();
                 storm();
                 return;
             }
-            if (!verifying) { enterOtpStep(form); return; }
+            if (!verifying && data.otp_required) { enterOtpStep(form); return; }
             success(data.user.name, data.redirect, data.registered ? "register" : mode, data.user.email);
         } catch (err) {
             showMsg(form, "Can't reach the server. Check your connection and try again.");
