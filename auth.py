@@ -6,7 +6,10 @@
 * Google / Facebook : OAuth 2.0 authorization-code flow (keys in .env).
 """
 
+import hashlib
+import hmac
 import os
+import random
 import re
 import secrets
 import smtplib
@@ -17,7 +20,8 @@ from datetime import datetime, timedelta, timezone
 from email.message import EmailMessage
 
 import requests
-from flask import Blueprint, jsonify, redirect, render_template, request, session, url_for
+from flask import Blueprint, Response, current_app, jsonify, redirect, render_template, request, session, url_for
+from itsdangerous import URLSafeTimedSerializer
 from werkzeug.security import check_password_hash, generate_password_hash
 
 bp = Blueprint("auth", __name__)
@@ -198,6 +202,98 @@ def normalize_phone(value):
 
 
 # ---------------------------------------------------------------------------
+# Captcha (server-side) + trusted devices
+#
+# * The captcha image is an SVG made on the server. The session only keeps a salted HMAC of the answer
+#   (never the text), the answer works once and expires after 5 minutes.
+# * An email is verified ONCE (OTP at registration, or Google). That moment marks this browser as a trusted
+#   device with a signed, HttpOnly cookie. After that, "email + captcha" is enough to log in on this device.
+#   By default that is all the login page asks for (email + captcha, no emailed code), on any device.
+#   Set STRICT_NEW_DEVICE_OTP=1 in .env to also require the emailed code once on a device that has not
+#   verified the account yet (safer: knowing an email address alone is then not enough).
+# ---------------------------------------------------------------------------
+
+CAPTCHA_CHARS = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
+CAPTCHA_TTL = 300
+DEVICE_COOKIE = "wg_device"
+DEVICE_MAX_AGE = 180 * 24 * 3600
+_hits = {}   # rate-limit buckets (in memory)
+
+
+def make_captcha_text():
+    return "".join(secrets.choice(CAPTCHA_CHARS) for _ in range(5))
+
+
+def _captcha_digest(text, nonce):
+    return hmac.new(current_app.secret_key.encode(), (nonce + text.upper()).encode(), hashlib.sha256).hexdigest()
+
+
+def captcha_svg(text):
+    rnd = random.SystemRandom()
+    out = ['<svg xmlns="http://www.w3.org/2000/svg" width="170" height="56" viewBox="0 0 170 56" role="img" aria-label="Captcha">',
+           '<rect width="170" height="56" rx="10" fill="#0e2230"/>']
+    for _ in range(7):
+        out.append('<line x1="%d" y1="%d" x2="%d" y2="%d" stroke="hsl(%d,60%%,60%%)" stroke-width="1.4" opacity=".55"/>'
+                   % (rnd.randint(0, 170), rnd.randint(0, 56), rnd.randint(0, 170), rnd.randint(0, 56), rnd.randint(0, 360)))
+    for i, ch in enumerate(text):
+        x, y = 16 + i * 29, 37 + rnd.randint(-4, 4)
+        out.append('<text x="%d" y="%d" font-size="%d" font-weight="700" font-family="Georgia,serif" fill="hsl(%d,75%%,72%%)" '
+                   'transform="rotate(%d %d %d)">%s</text>' % (x, y, rnd.randint(26, 32), rnd.randint(0, 360), rnd.randint(-22, 22), x, y, ch))
+    for _ in range(40):
+        out.append('<circle cx="%d" cy="%d" r="1.2" fill="#9fb4c4" opacity=".6"/>' % (rnd.randint(0, 170), rnd.randint(0, 56)))
+    out.append('<path d="M0 %d Q 60 %d 120 %d T 170 %d" fill="none" stroke="#38d996" stroke-width="1.6" opacity=".7"/>'
+               % (rnd.randint(10, 46), rnd.randint(0, 56), rnd.randint(10, 46), rnd.randint(10, 46)))
+    out.append("</svg>")
+    return "".join(out)
+
+
+def verify_captcha(answer):
+    """One-shot check: the stored captcha is consumed whether the answer is right or wrong."""
+    c = session.pop("captcha", None)
+    if not isinstance(c, dict) or time.time() > c.get("e", 0):
+        return False
+    answer = re.sub(r"\s+", "", str(answer or "")).upper()
+    return len(answer) >= 4 and hmac.compare_digest(str(c.get("h", "")), _captcha_digest(answer, str(c.get("n", ""))))
+
+
+def rate_limited(key, limit, window=300):
+    now = time.time()
+    hits = [t for t in _hits.get(key, []) if now - t < window]
+    if len(hits) >= limit:
+        _hits[key] = hits
+        return True
+    hits.append(now)
+    _hits[key] = hits
+    return False
+
+
+def _device_serializer():
+    return URLSafeTimedSerializer(current_app.secret_key, salt="wg-device-v1")
+
+
+def device_users():
+    """User ids this browser has verified on (empty when the cookie is missing, forged or old)."""
+    raw = request.cookies.get(DEVICE_COOKIE)
+    if not raw:
+        return []
+    try:
+        data = _device_serializer().loads(raw, max_age=DEVICE_MAX_AGE)
+    except Exception:
+        return []
+    ids = data.get("u") if isinstance(data, dict) else None
+    return [i for i in ids if isinstance(i, int)] if isinstance(ids, list) else []
+
+
+def trust_device(resp, user_id):
+    ids = device_users()
+    if user_id not in ids:
+        ids.append(user_id)
+    resp.set_cookie(DEVICE_COOKIE, _device_serializer().dumps({"u": ids[-5:]}), max_age=DEVICE_MAX_AGE,
+                    httponly=True, samesite="Lax", secure=os.getenv("COOKIE_SECURE", "").strip() == "1")
+    return resp
+
+
+# ---------------------------------------------------------------------------
 # One-time codes (shared by email and phone)
 # ---------------------------------------------------------------------------
 
@@ -322,9 +418,8 @@ def issue_otp(email, name, mode):
         raise
 
 
-def otp_sent_response(email):
-    return jsonify({"ok": True, "otp_required": True, "email": email,
-                    "message": "We sent a 6-digit code to your email."})
+def otp_sent_response(email, message="We sent a 6-digit code to your email."):
+    return jsonify({"ok": True, "otp_required": True, "email": email, "message": message})
 
 
 # ---------------------------------------------------------------------------
@@ -426,9 +521,21 @@ def register():
     return otp_sent_response(email)
 
 
+@bp.route("/auth/captcha")
+def captcha():
+    text = make_captcha_text()
+    nonce = secrets.token_hex(8)
+    session["captcha"] = {"n": nonce, "h": _captcha_digest(text, nonce), "e": time.time() + CAPTCHA_TTL}
+    resp = Response(captcha_svg(text), mimetype="image/svg+xml")
+    resp.headers["Cache-Control"] = "no-store"
+    return resp
+
+
 @bp.route("/auth/login", methods=["POST"])
 def login():
-    """Step 1 (existing user): send an OTP to the email."""
+    """Email + captcha. The email was verified when the account was created (OTP) or by Google, so the
+    login page does not ask for an emailed code. With STRICT_NEW_DEVICE_OTP=1 a device that has not verified
+    the account yet still gets the one-time code (step 2 is /auth/verify)."""
     data = request.get_json(silent=True) or {}
     email = clean_email(data.get("email"))
 
@@ -436,11 +543,25 @@ def login():
         return jsonify({"error": "Enter your email."}), 400
     if not valid_email(email):
         return jsonify({"error": "Enter a valid email address."}), 400
+    if rate_limited("login-ip:" + (request.remote_addr or "?"), 30) or rate_limited("login-mail:" + email, 10):
+        return jsonify({"error": "Too many attempts. Please wait a few minutes and try again."}), 429
+    if not verify_captcha(data.get("captcha")):
+        return jsonify({"error": "Captcha is incorrect. Try the new one.", "captcha_failed": True,
+                        "fields": {"captcha": "Captcha is incorrect."}}), 400
 
     with db() as conn:
-        row = conn.execute("SELECT name FROM users WHERE email = ?", (email,)).fetchone()
+        row = conn.execute("SELECT id, name FROM users WHERE email = ?", (email,)).fetchone()
     if not row:
         return jsonify({"error": "No account found for that email. Please register first."}), 404
+
+    strict = os.getenv("STRICT_NEW_DEVICE_OTP", "").strip() == "1"
+    if not strict or row["id"] in device_users():
+        now = datetime.now(timezone.utc).isoformat()
+        with db() as conn:
+            conn.execute("UPDATE users SET last_login = ? WHERE id = ?", (now, row["id"]))
+        start_session(row["id"], bool(data.get("remember", True)))
+        resp = jsonify({"ok": True, "verified": "device", "user": {"name": row["name"], "email": email}, "redirect": "/"})
+        return trust_device(resp, row["id"])
 
     if too_soon(email):
         return jsonify({"error": "Please wait a few seconds before requesting another code."}), 429
@@ -449,7 +570,7 @@ def login():
     except Exception:
         app_logger_error("Failed to send login OTP.")
         return jsonify({"error": "Could not send the verification email. Try again."}), 502
-    return otp_sent_response(email)
+    return otp_sent_response(email, "New device: we sent a 6-digit code to your email. You only need it once on this device.")
 
 
 @bp.route("/auth/verify", methods=["POST"])
@@ -475,13 +596,16 @@ def verify_otp():
                 if row:
                     _pending.pop(email, None)
                     return jsonify({"error": "That email is already registered. Log in instead."}), 409
-                conn.execute(
+                cur = conn.execute(
                     "INSERT INTO users (name, email, password_hash, created_at, last_login, provider) VALUES (?, ?, ?, ?, ?, ?)",
                     (p["name"], email, "!otp-only", now, None, "email"))
                 _pending.pop(email, None)
-                # Account created; no session yet - the page now opens the login section.
-                return jsonify({"ok": True, "registered": True,
-                                "user": {"name": p["name"], "email": email}, "redirect": None}), 201
+                # Account created and email verified; no session yet - the page now opens the login section.
+                # This browser is marked as trusted, so the next login only needs the captcha.
+                resp = jsonify({"ok": True, "registered": True,
+                                "user": {"name": p["name"], "email": email}, "redirect": None})
+                resp.status_code = 201
+                return trust_device(resp, cur.lastrowid)
             if not row:
                 _pending.pop(email, None)
                 return jsonify({"error": "No account found for that email. Please register first."}), 404
@@ -493,7 +617,8 @@ def verify_otp():
 
     _pending.pop(email, None)
     start_session(user_id, remember)
-    return jsonify({"ok": True, "user": {"name": name, "email": email}, "redirect": "/"})
+    resp = jsonify({"ok": True, "user": {"name": name, "email": email}, "redirect": "/"})
+    return trust_device(resp, user_id)
 
 
 @bp.route("/auth/resend", methods=["POST"])
@@ -574,7 +699,8 @@ def phone_verify():
 
     _pending.pop("tel:" + phone, None)
     start_session(user_id, remember)
-    return jsonify({"ok": True, "user": {"name": name, "email": email}, "redirect": "/"})
+    resp = jsonify({"ok": True, "user": {"name": name, "email": email}, "redirect": "/"})
+    return trust_device(resp, user_id)
 
 
 # ---------------------------------------------------------------------------
@@ -690,8 +816,17 @@ def social_callback(provider):
                 "INSERT INTO users (name, email, password_hash, created_at, last_login, provider) VALUES (?, ?, ?, ?, ?, ?)",
                 (display, email, "!oauth", now, now, provider))
             user_id = cur.lastrowid
+    # The provider already verified this email, so this browser becomes a trusted device: later logins can
+    # use email + captcha. "?welcome=1" tells the home page to play the logo animation.
     start_session(user_id, True)
-    return redirect("/")
+    return trust_device(redirect("/?welcome=1"), user_id)
+
+
+@bp.route("/auth/forget-device", methods=["POST"])
+def forget_device():
+    resp = jsonify({"ok": True})
+    resp.delete_cookie(DEVICE_COOKIE)
+    return resp
 
 
 @bp.route("/auth/logout", methods=["POST"])
