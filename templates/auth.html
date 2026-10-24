@@ -84,7 +84,7 @@
             <!-- LOGIN -->
             <form class="pane" id="loginForm" data-pane="login" novalidate autocomplete="on">
                 <h2>Welcome back</h2>
-                <p class="sub" data-sub="Log in to see the weather for your places. We will email you a one-time code.">Log in to see the weather for your places. We will email you a one-time code.</p>
+                <p class="sub" data-sub="Type your email and the captcha shown. Your email was verified when you created the account.">Type your email and the captcha shown. Your email was verified when you created the account.</p>
 
                 <label class="field">
                     <span class="ico">✉️</span>
@@ -92,6 +92,19 @@
                     <span class="lbl">Email address</span>
                     <small class="err"></small>
                 </label>
+
+                <div class="cap-row" data-cap>
+                    <div class="cap-img">
+                        <img id="capImg" alt="Captcha: type the characters you see" width="170" height="56">
+                        <button type="button" class="link-btn" id="capRefresh" aria-label="Get a new captcha">&#8635; New</button>
+                    </div>
+                    <label class="field">
+                        <span class="ico">&#128737;&#65039;</span>
+                        <input type="text" name="captcha" placeholder=" " autocomplete="off" autocapitalize="characters" maxlength="8" spellcheck="false">
+                        <span class="lbl">Type the captcha</span>
+                        <small class="err"></small>
+                    </label>
+                </div>
 
                 <div class="otp-box" data-otp-box>
                     <label class="field">
@@ -112,7 +125,7 @@
 
                 <p class="form-msg" role="alert"></p>
 
-                <button class="btn" type="submit"><span class="btn-t" data-label="Send OTP">Send OTP</span><span class="spin"></span></button>
+                <button class="btn" type="submit"><span class="btn-t" data-label="Log in">Log in</span><span class="spin"></span></button>
 
                 <p class="switch">New to WeatherGPT? <a href="/register" data-go="register">Create an account</a></p>
             </form>
