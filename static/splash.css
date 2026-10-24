@@ -1,0 +1,28 @@
+/* WeatherGPT - login logo animation */
+html.wg-splashing{overflow:hidden}
+#wgSplash{position:fixed;inset:0;z-index:2147483000;display:grid;place-items:center;overflow:hidden;color:#fff;
+  background:radial-gradient(circle at 50% 38%,#12506a 0%,#0a2433 55%,#050e16 100%);transition:opacity .7s ease,transform .7s ease}
+#wgSplash.out{opacity:0;transform:scale(1.06);pointer-events:none}
+.wgs-box{position:relative;text-align:center;animation:wgsPop .9s cubic-bezier(.2,1.3,.4,1) both}
+.wgs-logo{filter:drop-shadow(0 10px 30px rgba(56,217,150,.35));animation:wgsFloat 3s ease-in-out infinite}
+.wgs-sun{transform-origin:78px 38px;animation:wgsSpin 14s linear infinite}
+.wgs-cloud{stroke-dasharray:260;stroke-dashoffset:260;animation:wgsDraw 1.3s .2s ease forwards,wgsFill .6s 1.3s ease both}
+.wgs-drops path{stroke-dasharray:8;stroke-dashoffset:8;animation:wgsDraw 0.5s 1.4s ease forwards,wgsRain 1s 1.9s linear infinite}
+.wgs-name{font:800 clamp(32px,7vw,54px)/1.1 "Segoe UI",system-ui,sans-serif;letter-spacing:.02em;margin-top:6px}
+.wgs-name span{display:inline-block;opacity:0;transform:translateY(18px);animation:wgsLetter .5s calc(.9s + var(--i)*70ms) ease forwards}
+.wgs-name span:nth-child(n+8){color:#38d996}
+.wgs-tag{margin-top:8px;font-size:14px;letter-spacing:.28em;text-transform:uppercase;opacity:0;animation:wgsFade .7s 1.8s ease forwards}
+.wgs-bar{width:180px;height:4px;margin:22px auto 0;background:rgba(255,255,255,.14);border-radius:9px;overflow:hidden}
+.wgs-bar i{display:block;height:100%;width:100%;background:linear-gradient(90deg,#38d996,#ffc83d);transform-origin:left;animation:wgsLoad 2.4s .3s ease both}
+.wgs-rain i{position:absolute;top:-30px;width:2px;height:22px;background:linear-gradient(transparent,rgba(160,215,255,.55));animation:wgsFall linear infinite}
+@keyframes wgsPop{from{opacity:0;transform:scale(.6)}}
+@keyframes wgsFloat{50%{transform:translateY(-8px)}}
+@keyframes wgsSpin{to{transform:rotate(360deg)}}
+@keyframes wgsDraw{to{stroke-dashoffset:0}}
+@keyframes wgsFill{from{fill-opacity:0}}
+@keyframes wgsRain{to{stroke-dashoffset:-16}}
+@keyframes wgsLetter{to{opacity:1;transform:none}}
+@keyframes wgsFade{to{opacity:.85}}
+@keyframes wgsLoad{from{transform:scaleX(0)}}
+@keyframes wgsFall{to{transform:translateY(115vh)}}
+@media (prefers-reduced-motion:reduce){#wgSplash *,#wgSplash{animation-duration:.01ms!important;animation-delay:0s!important}.wgs-name span,.wgs-tag{opacity:1;transform:none}.wgs-cloud{stroke-dashoffset:0}.wgs-drops path{stroke-dashoffset:0}}
