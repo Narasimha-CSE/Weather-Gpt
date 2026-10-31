@@ -25,9 +25,8 @@ from itsdangerous import URLSafeTimedSerializer
 from werkzeug.security import check_password_hash, generate_password_hash
 
 bp = Blueprint("auth", __name__)
-
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-DATA_DIR = os.path.join(BASE_DIR, "data")
+DATA_DIR = "/tmp/weathergpt-data"
 DB_PATH = os.path.join(DATA_DIR, "weathergpt.db")
 
 EMAIL_RE = re.compile(r"^[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}$")
@@ -61,21 +60,15 @@ _pending = {}
 # ---------------------------------------------------------------------------
 
 def load_secret_key():
-    """SECRET_KEY from the environment, otherwise a random key persisted in data/secret.key."""
+    """Load SECRET_KEY from environment variables."""
     env_key = os.getenv("SECRET_KEY")
-    if env_key:
-        return env_key
-    os.makedirs(DATA_DIR, exist_ok=True)
-    path = os.path.join(DATA_DIR, "secret.key")
-    if os.path.exists(path):
-        with open(path, "r", encoding="utf-8") as f:
-            value = f.read().strip()
-            if value:
-                return value
-    value = secrets.token_hex(32)
-    with open(path, "w", encoding="utf-8") as f:
-        f.write(value)
-    return value
+
+    if not env_key:
+        raise RuntimeError(
+            "SECRET_KEY is missing. Please configure it in Vercel Environment Variables."
+        )
+
+    return env_key
 
 
 def db():
