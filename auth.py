@@ -70,7 +70,6 @@ def load_secret_key():
 
     return env_key
 
-
 def db():
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
