@@ -60,20 +60,28 @@ _pending = {}
 # ---------------------------------------------------------------------------
 
 def load_secret_key():
-    """Load SECRET_KEY from environment variables."""
+    """SECRET_KEY from the environment, otherwise a random key persisted in data/secret.key."""
     env_key = os.getenv("SECRET_KEY")
+    if env_key:
+        return env_key
+    os.makedirs(DATA_DIR, exist_ok=True)
+    path = os.path.join(DATA_DIR, "secret.key")
+    if os.path.exists(path):
+        with open(path, "r", encoding="utf-8") as f:
+            value = f.read().strip()
+            if value:
+                return value
+    value = secrets.token_hex(32)
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(value)
+    return value
 
-    if not env_key:
-        raise RuntimeError(
-            "SECRET_KEY is missing. Please configure it in Vercel Environment Variables."
-        )
-
-    return env_key
 
 def db():
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     return conn
+
 
 
 def init_db():
