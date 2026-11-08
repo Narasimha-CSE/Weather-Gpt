@@ -9,6 +9,7 @@ import time
 from datetime import datetime, timedelta, timezone
 
 import requests
+import open_meteo_cache
 from flask import Blueprint, Response, jsonify, request
 
 from i18n_data import LANG_INSTRUCTION, tr
@@ -117,25 +118,11 @@ _UA = {"User-Agent": "WeatherGPT/1.0 (weather app; open-meteo client)"}
 
 
 def om_get(url, params, timeout=20, tries=3):
-    """GET with a User-Agent, retries on 429/5xx/timeouts, and a readable error message."""
-    last = None
-    host = url.split("/")[2]
-    for n in range(tries):
-        try:
-            r = requests.get(url, params=params, headers=_UA, timeout=timeout)
-            if r.status_code == 200:
-                return r
-            try:
-                reason = r.json().get("reason") or r.text[:160]
-            except Exception:
-                reason = r.text[:160]
-            last = "HTTP %s from %s: %s" % (r.status_code, host, reason)
-            if r.status_code < 500 and r.status_code != 429:
-                break
-        except requests.RequestException as e:
-            last = "%s while contacting %s" % (type(e).__name__, host)
-        time.sleep(0.8 * (n + 1))
-    raise RuntimeError(last or "request failed")
+    """GET through the persistent SQLite cache (open_meteo_cache.py).
+
+    Fresh (<6 h) responses are served from disk; on HTTP 429 or temporary failures the last good response
+    (up to 7 days old) is returned instead; a 429 is never retried."""
+    return open_meteo_cache.cached_get(url, params, headers=_UA, timeout=timeout, tries=min(tries, 2))
 
 
 OM_FORECAST = "https://api.open-meteo.com/v1/forecast"
@@ -149,7 +136,7 @@ DAILY_VARS = ("weather_code,temperature_2m_max,temperature_2m_min,precipitation_
 
 def fetch_bundle(lat, lon):
     key = ("bundle", round(lat, 2), round(lon, 2))
-    hit = cache_get(key, 600)
+    hit = cache_get(key, 6 * 3600)
     if hit:
         return hit
 
@@ -191,6 +178,8 @@ def fetch_bundle(lat, lon):
         })
 
     bundle = {"hourly": hourly, "daily": daily, "offset": offset, "today": now_local.strftime("%Y-%m-%d")}
+    if getattr(resp, "stale", False):      # old copy served during a 429/outage: do not pin it in memory
+        return bundle
     return cache_set(key, bundle)
 
 
