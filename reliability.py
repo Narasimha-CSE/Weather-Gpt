@@ -30,6 +30,7 @@ import time
 from datetime import datetime, timedelta, timezone
 
 import requests
+import open_meteo_cache
 from flask import Blueprint, jsonify, request
 
 bp = Blueprint("reliability", __name__)
@@ -42,25 +43,11 @@ _UA = {"User-Agent": "WeatherGPT/1.0 (weather app; open-meteo client)"}
 
 
 def om_get(url, params, timeout=20, tries=3):
-    """GET with a User-Agent, retries on 429/5xx/timeouts, and a readable error message."""
-    last = None
-    host = url.split("/")[2]
-    for n in range(tries):
-        try:
-            r = requests.get(url, params=params, headers=_UA, timeout=timeout)
-            if r.status_code == 200:
-                return r
-            try:
-                reason = r.json().get("reason") or r.text[:160]
-            except Exception:
-                reason = r.text[:160]
-            last = "HTTP %s from %s: %s" % (r.status_code, host, reason)
-            if r.status_code < 500 and r.status_code != 429:
-                break
-        except requests.RequestException as e:
-            last = "%s while contacting %s" % (type(e).__name__, host)
-        time.sleep(0.8 * (n + 1))
-    raise RuntimeError(last or "request failed")
+    """GET through the persistent SQLite cache (open_meteo_cache.py).
+
+    Fresh (<6 h) responses are served from disk; on HTTP 429 or temporary failures the last good response
+    (up to 7 days old) is returned instead; a 429 is never retried."""
+    return open_meteo_cache.cached_get(url, params, headers=_UA, timeout=timeout, tries=min(tries, 2))
 
 
 OM_FORECAST = "https://api.open-meteo.com/v1/forecast"
@@ -266,43 +253,59 @@ def _parse_daily(daily, models):
 
 
 def fetch_models(lat, lon, days=10):
-    """Returns (dates, {model: series}) using the models that answered."""
+    """Returns (dates, {model: series}) using the models that answered.
+
+    Request budget: normally ONE call (all models together, served from the persistent cache when possible).
+    The one-by-one and best_match fallbacks run only for ordinary failures - never after HTTP 429."""
     key = ("multi", round(lat, 2), round(lon, 2), days)
-    hit = cache_get(key, 1800)
+    hit = cache_get(key, 6 * 3600)
     if hit:
         return hit
     ids = [m for m, _ in MODELS]
     base = {"latitude": lat, "longitude": lon, "daily": DAILY, "timezone": "auto",
             "forecast_days": days, "wind_speed_unit": "kmh"}
-    dates, series, err = [], {}, None
+    dates, series, err, stale, limited = [], {}, None, False, False
     try:
         r = om_get(OM_FORECAST, dict(base, models=",".join(ids)), timeout=20)
+        stale = getattr(r, "stale", False)
         j = r.json()
         dates = j.get("daily", {}).get("time", [])
         series = _parse_daily(j.get("daily", {}), ids)
+    except open_meteo_cache.RateLimitError as e:
+        raise RuntimeError("Open-Meteo rate limit reached and no saved forecast is available yet - "
+                           "please try again later (%s)." % e)
     except Exception as e:
         series, err = {}, e
-    if len(series) < 2:                    # combined call failed: ask the models one by one
+    if len(series) < 2 and not limited:    # combined call failed: ask the models one by one
         series = {}
         for m in ids:
             try:
-                j = om_get(OM_FORECAST, dict(base, models=m), timeout=15, tries=2).json()
+                r = om_get(OM_FORECAST, dict(base, models=m), timeout=15, tries=2)
+                stale = stale or getattr(r, "stale", False)
+                j = r.json()
                 parsed = _parse_daily(j.get("daily", {}), [m])
                 if parsed:
                     series.update(parsed)
                     dates = dates or j.get("daily", {}).get("time", [])
+            except open_meteo_cache.RateLimitError as e:
+                err, limited = e, True
+                break                      # rate limited: stop, do not send the remaining requests
             except Exception as e:
                 err = e
                 continue
-    if not series:                         # last resort: Open-Meteo's own blended forecast (one model)
+    if not series and not limited:         # last resort: Open-Meteo's own blended forecast (one model)
         try:
-            j = om_get(OM_FORECAST, base, timeout=15, tries=2).json()
+            r = om_get(OM_FORECAST, base, timeout=15, tries=2)
+            stale = stale or getattr(r, "stale", False)
+            j = r.json()
             series = _parse_daily(j.get("daily", {}), ["best_match"])
             dates = j.get("daily", {}).get("time", [])
         except Exception as e:
             err = e
     if not series:
         raise RuntimeError("No forecast model answered (%s)." % (err or "empty response"))
+    if stale:                              # old copy served during a 429/outage: do not pin it in memory
+        return (dates, series)
     return cache_set(key, (dates, series))
 
 
@@ -533,7 +536,7 @@ def build_reliability(lat, lon, lang):
 
 def get_cached(lat, lon, lang):
     key = ("rel", round(lat, 2), round(lon, 2), lang)
-    hit = cache_get(key, 900)
+    hit = cache_get(key, 3600)
     return hit or cache_set(key, build_reliability(lat, lon, lang))
 
 
@@ -703,7 +706,7 @@ def api_reliability_grid():
     if lat is None:
         return jsonify({"error": "Valid lat and lon are required."}), 400
     key = ("grid", round(lat, 1), round(lon, 1))
-    hit = cache_get(key, 1800)
+    hit = cache_get(key, 6 * 3600)
     if hit:
         return jsonify(hit)
     half = GRID_N // 2
@@ -725,6 +728,8 @@ def api_reliability_grid():
                 if parsed:
                     per_point[idx].update(parsed)
                     dates = dates or item.get("daily", {}).get("time", [])
+        except open_meteo_cache.RateLimitError:
+            break                          # rate limited: do not send the remaining model requests
         except Exception:
             continue
     model = load_model()
